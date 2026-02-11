@@ -1,0 +1,555 @@
+#!/usr/bin/env python3
+"""sls-slsm-mcp - MCP server bridging sls and slsm CLIs.
+
+A stdio MCP (Model Context Protocol) server that exposes sls (system log
+search) and slsm (SLS memory / error pattern playbook) as tools for
+Claude Code and other MCP-compatible AI coding agents.
+
+Requires:
+  - sls  (https://github.com/krasmussen37/sls)
+  - slsm (https://github.com/krasmussen37/sls-memory)
+  - Python 3.7+
+
+No external Python dependencies.
+"""
+
+__version__ = "0.1.0"
+
+import json
+import os
+import shutil
+import subprocess
+import sys
+
+# ---------------------------------------------------------------------------
+# Binary resolution: env var override > PATH lookup
+# ---------------------------------------------------------------------------
+SLS_BIN = os.environ.get("SLS_BIN") or shutil.which("sls")
+SLSM_BIN = os.environ.get("SLSM_BIN") or shutil.which("slsm")
+
+# ---------------------------------------------------------------------------
+# Tool definitions (MCP schema)
+# ---------------------------------------------------------------------------
+TOOLS = [
+    {
+        "name": "sls_search",
+        "description": (
+            "Search indexed system logs, application logs, and AI agent "
+            "stderr/session files. Returns matching log entries ranked by "
+            "relevance. Supports filtering by log level, service, and time "
+            "range. Use sls_context to drill into surrounding logs at a "
+            "specific timestamp."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "query": {
+                    "type": "string",
+                    "description": "Search query - keywords, error messages, service names",
+                },
+                "level": {
+                    "type": "string",
+                    "description": "Filter by log level: ERROR, WARN, INFO, DEBUG",
+                },
+                "service": {
+                    "type": "string",
+                    "description": "Filter by service name",
+                },
+                "since": {
+                    "type": "string",
+                    "description": "Time range: '1h', '30m', '1d', '7d', or ISO-8601 date",
+                },
+                "limit": {
+                    "type": "integer",
+                    "description": "Max results to return (default 50)",
+                    "default": 50,
+                },
+            },
+            "required": ["query"],
+        },
+    },
+    {
+        "name": "sls_context",
+        "description": (
+            "Get surrounding log entries around a specific timestamp or "
+            "agent session. Use this for root cause analysis - see what "
+            "happened before and after an error. Pass a timestamp from "
+            "sls_search results, or a session_id to see all logs from "
+            "that agent session."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "at": {
+                    "type": "string",
+                    "description": "Timestamp to center on (ISO-8601, epoch, or relative like '-5m')",
+                },
+                "session_id": {
+                    "type": "string",
+                    "description": "Agent session ID to get context for",
+                },
+                "window": {
+                    "type": "integer",
+                    "description": "Number of entries before/after to show (default 10)",
+                    "default": 10,
+                },
+            },
+        },
+    },
+    {
+        "name": "sls_timeline",
+        "description": (
+            "Show activity timeline aggregated by time buckets. See when "
+            "errors spiked, which hours had the most activity, and overall "
+            "log volume patterns."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "since": {
+                    "type": "string",
+                    "description": "Time range: '1h', '1d', '7d', 'today' (default '24h')",
+                    "default": "24h",
+                },
+                "group_by": {
+                    "type": "string",
+                    "description": "Bucket size: 'minute', 'hour', 'day' (default 'hour')",
+                    "default": "hour",
+                },
+            },
+        },
+    },
+    {
+        "name": "sls_alert",
+        "description": (
+            "Check error/warning thresholds. Returns OK, WARNING, or "
+            "CRITICAL status based on log counts in the time window. "
+            "Useful for quick health checks before starting work."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "since": {
+                    "type": "string",
+                    "description": "Time range to check (default '1h')",
+                    "default": "1h",
+                },
+                "error_threshold": {
+                    "type": "integer",
+                    "description": "Error count for CRITICAL status (default 1)",
+                    "default": 1,
+                },
+                "warning_threshold": {
+                    "type": "integer",
+                    "description": "Warning count for WARNING status (default 10)",
+                    "default": 10,
+                },
+                "service": {
+                    "type": "string",
+                    "description": "Filter by service name",
+                },
+            },
+        },
+    },
+    {
+        "name": "slsm_context",
+        "description": (
+            "Look up known fixes for an error. Searches the error pattern "
+            "playbook for matching patterns and returns root causes, fixes, "
+            "and confidence scores. Use this FIRST when encountering any "
+            "error to check if it's a known issue with a known fix."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "error": {
+                    "type": "string",
+                    "description": "Error message or stack trace to look up",
+                },
+                "limit": {
+                    "type": "integer",
+                    "description": "Max patterns to return (default 5)",
+                    "default": 5,
+                },
+            },
+            "required": ["error"],
+        },
+    },
+    {
+        "name": "slsm_add_pattern",
+        "description": (
+            "Add a new error pattern to the playbook. Use this when you "
+            "diagnose and fix an error that isn't already in the playbook, "
+            "so future encounters are resolved instantly."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "title": {
+                    "type": "string",
+                    "description": "Human-readable title for the pattern",
+                },
+                "pattern": {
+                    "type": "string",
+                    "description": "Regex pattern to match the error",
+                },
+                "category": {
+                    "type": "string",
+                    "description": "Category: network, database, filesystem, memory, general",
+                },
+                "severity": {
+                    "type": "string",
+                    "description": "Severity: low, medium, high",
+                },
+            },
+            "required": ["title", "pattern"],
+        },
+    },
+    {
+        "name": "slsm_feedback",
+        "description": (
+            "Give feedback on an error pattern - mark it as helpful or "
+            "harmful. This improves pattern quality over time. When "
+            "slsm_context returns a pattern that helped fix an issue, "
+            "mark it helpful. When it was wrong, mark it harmful."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "id": {
+                    "type": "string",
+                    "description": "Pattern ID (e.g., 'slsm-001')",
+                },
+                "feedback": {
+                    "type": "string",
+                    "description": "'helpful' or 'harmful'",
+                },
+                "reason": {
+                    "type": "string",
+                    "description": "Optional reason for the feedback",
+                },
+            },
+            "required": ["id", "feedback"],
+        },
+    },
+    {
+        "name": "slsm_reflect",
+        "description": (
+            "Auto-extract new error patterns from recent logs. Queries "
+            "the SLS database for recurring errors and creates new "
+            "playbook entries. Can be slow (reads SLS database). Use "
+            "--dry-run to preview without saving."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "days": {
+                    "type": "integer",
+                    "description": "Lookback days (default 7)",
+                    "default": 7,
+                },
+                "min_count": {
+                    "type": "integer",
+                    "description": "Minimum occurrences to suggest a pattern (default 3)",
+                    "default": 3,
+                },
+                "dry_run": {
+                    "type": "boolean",
+                    "description": "If true, show proposed patterns without saving them",
+                    "default": False,
+                },
+            },
+        },
+    },
+]
+
+# ---------------------------------------------------------------------------
+# CLI helpers
+# ---------------------------------------------------------------------------
+
+def run_command(args, timeout=30):
+    """Run a CLI command and return its output."""
+    try:
+        env = os.environ.copy()
+        env["NO_COLOR"] = "1"
+
+        result = subprocess.run(
+            args,
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+            env=env,
+        )
+        output = result.stdout
+        if result.returncode != 0 and result.stderr:
+            output = (output + "\nSTDERR: " + result.stderr).strip()
+        return output.strip() if output.strip() else "(no output)"
+    except subprocess.TimeoutExpired:
+        return "Error: Command timed out after {}s".format(timeout)
+    except Exception as e:
+        return "Error: {}".format(str(e))
+
+
+# ---------------------------------------------------------------------------
+# Tool dispatch
+# ---------------------------------------------------------------------------
+
+def handle_tool_call(name, arguments):
+    """Execute a tool and return its output."""
+
+    # -- sls tools -----------------------------------------------------------
+
+    if name == "sls_search":
+        args = [SLS_BIN, "search", arguments["query"], "--json"]
+        if arguments.get("level"):
+            args.extend(["--level", arguments["level"]])
+        if arguments.get("service"):
+            args.extend(["--service", arguments["service"]])
+        if arguments.get("since"):
+            args.extend(["--since", arguments["since"]])
+        if arguments.get("limit"):
+            args.extend(["--limit", str(arguments["limit"])])
+        raw = run_command(args)
+
+        # Reshape: compact entries to conserve agent context window
+        try:
+            data = json.loads(raw)
+            brief_entries = []
+            for entry in data.get("entries", []):
+                brief_entries.append({
+                    "id": entry.get("id"),
+                    "timestamp": entry.get("timestamp", ""),
+                    "level": entry.get("level", ""),
+                    "service": entry.get("service", ""),
+                    "message": entry.get("message", "")[:300],
+                })
+            shaped = {
+                "query": data.get("query", ""),
+                "total_matches": data.get("total_matches", 0),
+                "showing": len(brief_entries),
+                "entries": brief_entries,
+                "tip": "Use sls_context with a timestamp to see surrounding logs for root cause analysis.",
+            }
+            return json.dumps(shaped, indent=2)
+        except (json.JSONDecodeError, TypeError):
+            return raw
+
+    elif name == "sls_context":
+        args = [SLS_BIN, "context", "--json"]
+        if arguments.get("at"):
+            args.extend(["--at", arguments["at"]])
+        if arguments.get("session_id"):
+            args.extend(["--session-id", arguments["session_id"]])
+        if arguments.get("window"):
+            args.extend(["--window", str(arguments["window"])])
+        return run_command(args)
+
+    elif name == "sls_timeline":
+        args = [SLS_BIN, "timeline", "--json"]
+        since = arguments.get("since", "24h")
+        if since == "today":
+            args.append("--today")
+        else:
+            args.extend(["--since", since])
+        if arguments.get("group_by"):
+            args.extend(["--group-by", arguments["group_by"]])
+        return run_command(args)
+
+    elif name == "sls_alert":
+        args = [SLS_BIN, "alert", "--json"]
+        if arguments.get("since"):
+            args.extend(["--since", arguments["since"]])
+        if arguments.get("error_threshold"):
+            args.extend(["--error-threshold", str(arguments["error_threshold"])])
+        if arguments.get("warning_threshold"):
+            args.extend(["--warning-threshold", str(arguments["warning_threshold"])])
+        if arguments.get("service"):
+            args.extend(["--service", arguments["service"]])
+        return run_command(args)
+
+    # -- slsm tools ----------------------------------------------------------
+
+    elif name == "slsm_context":
+        args = [SLSM_BIN, "context", arguments["error"], "--json"]
+        if arguments.get("limit"):
+            args.extend(["--limit", str(arguments["limit"])])
+        return run_command(args)
+
+    elif name == "slsm_add_pattern":
+        args = [
+            SLSM_BIN, "playbook", "add",
+            "--title", arguments["title"],
+            "--pattern", arguments["pattern"],
+            "--json",
+        ]
+        if arguments.get("category"):
+            args.extend(["--category", arguments["category"]])
+        if arguments.get("severity"):
+            args.extend(["--severity", arguments["severity"]])
+        return run_command(args)
+
+    elif name == "slsm_feedback":
+        args = [SLSM_BIN, "mark", arguments["id"], arguments["feedback"], "--json"]
+        if arguments.get("reason"):
+            args.extend(["--reason", arguments["reason"]])
+        return run_command(args)
+
+    elif name == "slsm_reflect":
+        args = [SLSM_BIN, "reflect", "--json"]
+        days = arguments.get("days", 7)
+        args.extend(["--days", str(days)])
+        if arguments.get("min_count"):
+            args.extend(["--min-count", str(arguments["min_count"])])
+        if arguments.get("dry_run"):
+            args.append("--dry-run")
+        return run_command(args, timeout=120)
+
+    else:
+        return "Unknown tool: {}".format(name)
+
+
+# ---------------------------------------------------------------------------
+# MCP protocol (JSON-RPC 2.0 over stdio)
+# ---------------------------------------------------------------------------
+
+def send_response(response):
+    """Send a JSON-RPC response to stdout."""
+    msg = json.dumps(response)
+    sys.stdout.write(msg + "\n")
+    sys.stdout.flush()
+
+
+def handle_message(msg):
+    """Process a single JSON-RPC message."""
+    method = msg.get("method")
+    msg_id = msg.get("id")
+
+    if method == "initialize":
+        send_response({
+            "jsonrpc": "2.0",
+            "id": msg_id,
+            "result": {
+                "protocolVersion": "2024-11-05",
+                "capabilities": {"tools": {}},
+                "serverInfo": {
+                    "name": "sls-slsm-mcp",
+                    "version": __version__,
+                },
+            },
+        })
+
+    elif method == "notifications/initialized":
+        pass  # No response for notifications
+
+    elif method == "tools/list":
+        send_response({
+            "jsonrpc": "2.0",
+            "id": msg_id,
+            "result": {"tools": TOOLS},
+        })
+
+    elif method == "tools/call":
+        params = msg.get("params", {})
+        tool_name = params.get("name", "")
+        tool_args = params.get("arguments", {})
+
+        try:
+            output = handle_tool_call(tool_name, tool_args)
+            send_response({
+                "jsonrpc": "2.0",
+                "id": msg_id,
+                "result": {
+                    "content": [{"type": "text", "text": output}],
+                },
+            })
+        except Exception as e:
+            send_response({
+                "jsonrpc": "2.0",
+                "id": msg_id,
+                "result": {
+                    "content": [{"type": "text", "text": "Error: {}".format(str(e))}],
+                    "isError": True,
+                },
+            })
+
+    elif method == "ping":
+        send_response({"jsonrpc": "2.0", "id": msg_id, "result": {}})
+
+    elif msg_id is not None:
+        send_response({
+            "jsonrpc": "2.0",
+            "id": msg_id,
+            "error": {
+                "code": -32601,
+                "message": "Method not found: {}".format(method),
+            },
+        })
+
+
+# ---------------------------------------------------------------------------
+# Entry point
+# ---------------------------------------------------------------------------
+
+def check_prerequisites():
+    """Verify sls and slsm binaries are available. Exit with guidance if not."""
+    missing = []
+    if not SLS_BIN:
+        missing.append(
+            "  sls  - not found. Install from: https://github.com/krasmussen37/sls"
+        )
+    if not SLSM_BIN:
+        missing.append(
+            "  slsm - not found. Install from: https://github.com/krasmussen37/sls-memory"
+        )
+    if missing:
+        print("sls-slsm-mcp: missing required binaries:", file=sys.stderr)
+        for m in missing:
+            print(m, file=sys.stderr)
+        print(
+            "\nSet SLS_BIN / SLSM_BIN environment variables or add them to PATH.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+
+def main():
+    """Main entry point."""
+    # Handle CLI flags
+    if len(sys.argv) > 1:
+        arg = sys.argv[1]
+        if arg in ("--version", "-V"):
+            print("sls-slsm-mcp {}".format(__version__))
+            sys.exit(0)
+        elif arg in ("--help", "-h"):
+            print("sls-slsm-mcp {} - MCP server for sls + slsm".format(__version__))
+            print()
+            print("Usage: sls-slsm-mcp          Start MCP server (stdio)")
+            print("       sls-slsm-mcp --version")
+            print("       sls-slsm-mcp --help")
+            print()
+            print("Environment variables:")
+            print("  SLS_BIN    Path to sls binary (default: auto-detect from PATH)")
+            print("  SLSM_BIN   Path to slsm binary (default: auto-detect from PATH)")
+            sys.exit(0)
+
+    check_prerequisites()
+
+    # MCP servers must not pollute stdout with stray output.
+    # Redirect stderr to devnull to suppress subprocess noise.
+    # Set SLS_SLSM_MCP_DEBUG=1 to keep stderr open for troubleshooting.
+    if not os.environ.get("SLS_SLSM_MCP_DEBUG"):
+        sys.stderr = open(os.devnull, "w")
+
+    for line in sys.stdin:
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            msg = json.loads(line)
+            handle_message(msg)
+        except json.JSONDecodeError:
+            continue
+
+
+if __name__ == "__main__":
+    main()
